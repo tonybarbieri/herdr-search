@@ -416,6 +416,10 @@ def main():
             st = files[rel]
             text = read_text(root, rel)
             if text is None:
+                # Binary or non-UTF-8 now: drop any points from when it was text. Skip the
+                # request when the manifest already records it as unreadable.
+                if known.get(rel, {}).get("hash") != "":
+                    delete_files(name, [rel])
                 known[rel] = {"mtime_ns": st.st_mtime_ns, "size": st.st_size, "hash": ""}
                 continue
             h = file_hash(text)
