@@ -8,6 +8,25 @@ const execFileAsync = promisify(execFile);
 
 export default function (pi: ExtensionAPI) {
   const binaryPath = path.join(os.homedir(), ".local/bin/herdr-search");
+  const indexerPath = path.join(os.homedir(), ".local/bin/herdr-index");
+
+  // Probe the search backends when a session starts (skipped if a healthy check is under 5 minutes
+  // old). A failure also raises the Herdr sidebar warning and notification; this adds a pi notice.
+  pi.on("session_start", (_event, ctx) => {
+    execFile(indexerPath, ["--doctor", "--max-age", "300"], { timeout: 60_000 }, (err, stdout) => {
+      if (!err) return;
+      const problems = stdout
+        .split("\n")
+        .filter((l) => l.startsWith("FAIL"))
+        .map((l) => l.replace(/^FAIL\s+/, ""))
+        .join("; ");
+      try {
+        ctx.ui.notify(`Semantic search is down: ${problems || (err as Error).message}`, "warning");
+      } catch {
+        // no UI available (non-interactive session)
+      }
+    });
+  });
 
   pi.registerTool({
     name: "semantic_code_search",

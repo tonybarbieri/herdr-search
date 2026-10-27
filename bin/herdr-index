@@ -9,8 +9,10 @@ Usage: herdr-index [options]
   --quiet         print nothing unless something goes wrong
   --prune         also delete indexed points for files that are no longer indexable (stale or foreign points)
   --collection N  write to collection N instead of the root's ws- hash (for experiments)
+  --doctor        probe Qdrant and Ollama, record the result and show/clear the Herdr warning; exit 1 if unhealthy
+  --max-age SEC   with --doctor: skip the probe if a healthy check is newer than SEC seconds
   --allow-nongit  index a directory that is not a git repository (walks it; skips VCS/vendor dirs)
-Exit codes: 0 up to date, 2 error, 3 budget hit (more work pending), 4 another indexer is running.
+Exit codes: 0 up to date, 1 unhealthy (--doctor), 2 error, 3 budget hit (more work pending), 4 another indexer is running.
 
 Writes one collection per workspace ("ws-" + sha256(root)[:16], 768-d cosine, payload
 filePath/codeChunk/startLine/endLine/segmentHash/pathSegments) with point ids uuid5(segmentHash,
@@ -18,7 +20,7 @@ ID_NAMESPACE). Chunking is line-based (max ~1150 chars, preferring declaration/b
 boundaries). Change detection uses a local manifest in ~/.cache/herdr-index/.
 Honors .gitignore (via git) and an optional .herdrignore (gitignore syntax) at the root.
 """
-import fcntl, hashlib, json, os, re, subprocess, sys, time, uuid
+import fcntl, hashlib, json, os, re, shutil, subprocess, sys, time, uuid
 import requests
 
 QDRANT = os.environ.get("HERDR_QDRANT", "http://localhost:6333")
@@ -26,7 +28,7 @@ OLLAMA = os.environ.get("HERDR_OLLAMA", "http://localhost:11434")
 MODEL = "nomic-embed-text"
 DIM = 768
 ID_NAMESPACE = uuid.UUID("f47ac10b-58cc-4372-a567-0e02b2c3d479")
-CACHE = os.path.expanduser("~/.cache/herdr-index")
+CACHE = os.environ.get("HERDR_INDEX_CACHE") or os.path.expanduser("~/.cache/herdr-index")
 
 MAX_CHARS = 1150        # hard chunk ceiling (1000 * 1.15)
 SOFT_CHARS = 600        # prefer to cut at a boundary line once a chunk is this long
@@ -287,10 +289,141 @@ def file_hash(text):
 
 # ---------------------------------------------------------------- main
 
+# ---------------------------------------------------------------- health
+
+HEALTH = os.path.join(CACHE, "health.json")
+HEALTH_SOURCE = "herdr-index-health"
+
+
+def check_health():
+    """Probe the backends. Returns [(component, ok, detail)]."""
+    out = []
+    try:
+        requests.get(f"{QDRANT}/collections", timeout=3).raise_for_status()
+        out.append(("qdrant", True, QDRANT))
+    except Exception:
+        out.append(("qdrant", False, f"Qdrant is not reachable at {QDRANT}"))
+    try:
+        models = requests.get(f"{OLLAMA}/api/tags", timeout=3).json().get("models", [])
+    except Exception:
+        out.append(("ollama", False, f"Ollama is not reachable at {OLLAMA}"))
+        return out
+    if not any(m.get("name", "").split(":")[0] == MODEL for m in models):
+        out.append(("ollama", False, f"Ollama is running but model {MODEL} is not installed (ollama pull {MODEL})"))
+        return out
+    try:
+        r = requests.post(f"{OLLAMA}/api/embed", json={"model": MODEL, "input": ["health check"]}, timeout=30)
+        r.raise_for_status()
+        dim = len(r.json()["embeddings"][0])
+        if dim == DIM:
+            out.append(("ollama", True, f"{MODEL} at {OLLAMA}"))
+        else:
+            out.append(("ollama", False, f"{MODEL} returned {dim}-d vectors, expected {DIM}"))
+    except Exception as e:
+        out.append(("ollama", False, f"Ollama cannot embed with {MODEL} ({e})"))
+    return out
+
+
+def herdr_cli(*args):
+    exe = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr")
+    if not exe:
+        return None
+    try:
+        return subprocess.run([exe, *args], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return None
+
+
+def show_warning(text):
+    """Set (or clear, with None) the `searchwarn` sidebar token on every Herdr workspace."""
+    try:
+        ids = [w["workspace_id"] for w in json.loads(herdr_cli("workspace", "list"))["result"]["workspaces"]]
+    except Exception:
+        return
+    for ws in ids:
+        herdr_cli("workspace", "report-metadata", ws, "--source", HEALTH_SOURCE,
+                  *(["--token", f"searchwarn={text}"] if text else ["--clear-token", "searchwarn"]))
+
+
+def load_health():
+    try:
+        return json.load(open(HEALTH))
+    except Exception:
+        return {}
+
+
+def record_health(results):
+    """Persist the state; warn in Herdr while unhealthy, notify once per change."""
+    os.makedirs(CACHE, exist_ok=True)
+    with open(HEALTH + ".lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        prev = load_health()
+        was_ok = prev.get("ok", True)
+        bad = [r for r in results if not r[1]]
+        ok = not bad
+        now = time.time()
+        state = {"ok": ok, "checked_at": now,
+                 "since": prev["since"] if prev.get("ok") == ok and "since" in prev else now,
+                 "components": [c for c, _, _ in bad], "problems": [d for _, _, d in bad]}
+        tmp = f"{HEALTH}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, HEALTH)
+        if not ok:
+            show_warning(("⚠ search down: " + ", ".join(state["components"]))[:80])
+            if was_ok:
+                herdr_cli("notification", "show", "Semantic search is down",
+                          "--body", "; ".join(state["problems"])[:200], "--sound", "request")
+        elif not was_ok:
+            show_warning(None)
+            herdr_cli("notification", "show", "Semantic search recovered", "--sound", "done")
+    return state
+
+
+def run_doctor(max_age):
+    prev = load_health()
+    if max_age and prev.get("ok") and time.time() - prev.get("checked_at", 0) < max_age:
+        log("ok   (recent check)")
+        return 0
+    results = check_health()
+    state = record_health(results)
+    for c, ok, d in results:
+        log(f"{'ok  ' if ok else 'FAIL'} {c}: {d}")
+    root = git(os.getcwd(), "rev-parse", "--show-toplevel", check=False).decode().strip()
+    if root and results[0][1]:
+        name = collection_for(root)
+        try:
+            log(f"info index {name}: {q('GET', f'/collections/{name}')['points_count']} points")
+        except Exception:
+            log(f"info index {name}: not built yet (the first search builds it)")
+    return 0 if state["ok"] else 1
+
+
+def report_failure(e):
+    """An indexing run died: record why, so the failure is visible outside the agent run."""
+    try:
+        results = check_health()
+        if all(ok for _, ok, _ in results):
+            results.append(("indexer", False, f"indexing failed: {e}"))
+        record_health(results)
+    except Exception:
+        pass
+
+
+def recover_if_needed():
+    """After a successful run, re-probe if the last recorded state was unhealthy."""
+    try:
+        if not load_health().get("ok", True):
+            record_health(check_health())
+    except Exception:
+        pass
+
+
 def main():
     global QUIET
     args = sys.argv[1:]
     root, budget, full, status, QUIET, allow_nongit, collection, prune = None, None, False, False, False, False, None, False
+    doctor, max_age = False, 0.0
     while args:
         a = args.pop(0)
         if a == "--root" and args:
@@ -305,12 +438,18 @@ def main():
             QUIET = True
         elif a == "--prune":
             prune = True
+        elif a == "--doctor":
+            doctor = True
+        elif a == "--max-age" and args:
+            max_age = float(args.pop(0))
         elif a == "--collection" and args:
             collection = args.pop(0)
         elif a == "--allow-nongit":
             allow_nongit = True
         else:
             die(f"unknown option {a}")
+    if doctor:
+        sys.exit(run_doctor(max_age))
     if root is None:
         root = git(os.getcwd(), "rev-parse", "--show-toplevel", check=False).decode().strip() or os.getcwd()
     is_git = git(root, "rev-parse", "--is-inside-work-tree", check=False).strip() == b"true"
@@ -456,7 +595,12 @@ if __name__ == "__main__":
     QUIET = False
     try:
         main()
-    except SystemExit:
+    except SystemExit as e:
+        if e.code in (None, 0, 3):
+            recover_if_needed()
         raise
     except Exception as e:
+        report_failure(e)
         die(str(e))
+    else:
+        recover_if_needed()

@@ -13,10 +13,12 @@ files that contain identifier-like query terms (camelCase, snake_case, dotted,
 re-located against the file on disk, so line numbers stay right after edits the
 index hasn't caught up with; chunks that no longer exist are marked stale.
 """
-import os, re, sys, hashlib, subprocess, requests
+import os, re, sys, json, hashlib, subprocess, requests
 
-QDRANT = "http://localhost:6333"
-OLLAMA = "http://localhost:11434/api/embeddings"
+QDRANT = os.environ.get("HERDR_QDRANT", "http://localhost:6333")
+OLLAMA = os.environ.get("HERDR_OLLAMA", "http://localhost:11434") + "/api/embeddings"
+INDEXER = os.path.expanduser("~/.local/bin/herdr-index")
+HEALTH = os.path.join(os.environ.get("HERDR_INDEX_CACHE") or os.path.expanduser("~/.cache/herdr-index"), "health.json")
 TIMEOUT = 20
 REFRESH_BUDGET = 25  # seconds of foreground indexing before handing off to the background
 CANDIDATES = 64      # raw semantic hits fetched before grouping
@@ -28,6 +30,17 @@ GREP_ONLY_FILES = 2  # files found only by identifier match that may be added
 
 def fail(msg):
     sys.exit(f"herdr-search: {msg}")
+
+def unavailable(cause):
+    """A backend is down: re-probe (which raises the Herdr warning) and say what is wrong."""
+    detail = ""
+    try:
+        subprocess.run([INDEXER, "--doctor", "--quiet"], capture_output=True, timeout=60)
+        detail = "; ".join(json.load(open(HEALTH)).get("problems", []))
+    except Exception:
+        pass
+    fail(f"semantic search is unavailable: {detail or cause}. Tell the user the search backend needs "
+         f"attention before falling back to grep.")
 
 # Flags may arrive as separate argv entries or embedded at the start of a single
 # query string (the pi tool passes one argument).
@@ -67,14 +80,13 @@ main_root = os.path.dirname(common) if os.path.basename(common) == ".git" else "
 try:
     collections = [c["name"] for c in requests.get(f"{QDRANT}/collections", timeout=TIMEOUT).json()["result"]["collections"]]
 except Exception as e:
-    fail(f"Qdrant unreachable at {QDRANT} ({e})")
+    unavailable(f"Qdrant unreachable at {QDRANT} ({e})")
 index_root = next((r for r in (work_root, main_root) if r and collection_for(r) in collections), main_root or work_root)
 target = os.environ.get("HERDR_COLLECTION") or collection_for(index_root)
 
 # Keep the index fresh without VS Code: herdr-index re-embeds only changed files. Work beyond
 # the time budget continues in a detached background run.
 notes = []
-INDEXER = os.path.expanduser("~/.local/bin/herdr-index")
 if os.path.exists(INDEXER) and not os.environ.get("HERDR_NO_REFRESH") and git(index_root, "rev-parse", "--is-inside-work-tree") == "true":
     try:
         r = subprocess.run([INDEXER, "--quiet", "--budget", str(REFRESH_BUDGET), "--root", index_root, *(["--collection", target] if os.environ.get("HERDR_COLLECTION") else [])],
@@ -101,7 +113,7 @@ for n in notes:
 try:
     vector = requests.post(OLLAMA, json={"model": "nomic-embed-text", "prompt": QUERY}, timeout=TIMEOUT).json()["embedding"]
 except Exception as e:
-    fail(f"embedding failed via Ollama ({e}); is `ollama serve` running with nomic-embed-text?")
+    unavailable(f"embedding failed via Ollama ({e}); is `ollama serve` running with nomic-embed-text?")
 
 body = {"query": vector, "limit": CANDIDATES, "with_payload": True}
 if prefixes:
@@ -115,7 +127,7 @@ try:
     points = requests.post(f"{QDRANT}/collections/{target}/points/query", json=body,
                            timeout=TIMEOUT).json().get("result", {}).get("points", [])
 except Exception as e:
-    fail(f"Qdrant query failed ({e})")
+    unavailable(f"Qdrant query failed ({e})")
 
 def weight(path):
     # Prefer implementation over tests and drop archived logs unless --all.

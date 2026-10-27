@@ -24,7 +24,7 @@ pi tool semantic_code_search  ->  herdr-search  ->  herdr-index (refresh) -> Oll
 - Qdrant on `localhost:6333`
 - pi (for the tool wrapper) and optionally Herdr (for the sidebar indicator)
 
-Override endpoints with `HERDR_QDRANT` and `HERDR_OLLAMA`.
+Override endpoints with `HERDR_QDRANT` and `HERDR_OLLAMA`, and the cache directory with `HERDR_INDEX_CACHE`.
 
 ## Install
 
@@ -62,7 +62,8 @@ herdr-search [--files N] [--path PREFIX] [--list] [--all] <query...>
 
 herdr-index [--root DIR] [--budget SEC] [--full] [--status] [--prune] [--quiet]
             [--collection NAME] [--allow-nongit]
-# exit codes: 0 up to date, 2 error, 3 budget hit (more pending), 4 another run active
+herdr-index --doctor [--max-age SEC]
+# exit codes: 0 up to date, 1 unhealthy (--doctor), 2 error, 3 budget hit (more pending), 4 another run active
 ```
 
 Environment: `HERDR_NO_REFRESH=1` skips the refresh in `herdr-search`; `HERDR_COLLECTION` overrides
@@ -73,6 +74,22 @@ the collection (for experiments).
 Inside Herdr, `herdr-index` sets an `indexing` token on the current workspace
 (`herdr workspace report-metadata`, 20 s TTL) once a run lasts more than 1 s. Add the row from
 `config/herdr-sidebar.toml` to your Herdr config to display it.
+
+## Health monitoring
+
+Failures should not be visible only inside an agent run. `herdr-index --doctor` probes Qdrant, and
+Ollama (reachable, `nomic-embed-text` installed, embeddings are 768-d), records the result in
+`~/.cache/herdr-index/health.json` and exits 1 if anything is wrong. It runs:
+
+- when a pi session starts (the extension; skipped if a healthy check is under 5 minutes old),
+- when a search or an indexing run fails (which also puts the cause in the error the agent sees),
+- after any successful run that follows an unhealthy state, so recovery is noticed.
+
+While unhealthy, every Herdr workspace shows a red `⚠ search down: <component>` row (the
+`$searchwarn` token in `config/herdr-sidebar.toml`), and Herdr posts one notification when the state
+flips to unhealthy and one when it recovers. Errors returned to agents say what is down and tell them
+to report it to you before falling back to grep. There is no background daemon, so a backend that
+dies between sessions is noticed at the next session start or search.
 
 ## Notes
 

@@ -1,8 +1,10 @@
 # Add to ~/.config/herdr/config.toml, then run: herdr server reload-config
-# Shows "⟳ indexing N/M" on the workspace row while herdr-index is embedding files.
+# Shows "⟳ indexing N/M" on the workspace row while herdr-index is embedding files, and a red
+# "⚠ search down: ..." warning on every workspace while Qdrant or Ollama is unreachable.
 [ui.sidebar.spaces]
 rows = [
   ["state_icon", "workspace"],
   ["branch", "git_status"],
   [{ token = "$indexing", fg = "#f9e2af", bold = true }],
+  [{ token = "$searchwarn", fg = "#f38ba8", bold = true }],
 ]
