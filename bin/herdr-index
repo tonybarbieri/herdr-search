@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""Standalone codebase indexer: keeps the Qdrant index behind herdr-search fresh without VS Code.
+
+Usage: herdr-index [options]
+  --root DIR      workspace root to index (default: git root of the current directory)
+  --budget SEC    stop after SEC seconds of work; exit 3 if files are still pending
+  --full          ignore the local manifest and re-index every file
+  --status        report index freshness without changing anything
+  --quiet         print nothing unless something goes wrong
+  --prune         also delete indexed points for files that are no longer indexable (stale or foreign points)
+  --collection N  write to collection N instead of the root's ws- hash (for experiments)
+  --allow-nongit  index a directory that is not a git repository (walks it; skips VCS/vendor dirs)
+Exit codes: 0 up to date, 2 error, 3 budget hit (more work pending), 4 another indexer is running.
+
+Writes one collection per workspace ("ws-" + sha256(root)[:16], 768-d cosine, payload
+filePath/codeChunk/startLine/endLine/segmentHash/pathSegments) with point ids uuid5(segmentHash,
+ID_NAMESPACE). Chunking is line-based (max ~1150 chars, preferring declaration/blank-line
+boundaries). Change detection uses a local manifest in ~/.cache/herdr-index/.
+Honors .gitignore (via git) and an optional .herdrignore (gitignore syntax) at the root.
+"""
+import fcntl, hashlib, json, os, re, subprocess, sys, time, uuid
+import requests
+
+QDRANT = os.environ.get("HERDR_QDRANT", "http://localhost:6333")
+OLLAMA = os.environ.get("HERDR_OLLAMA", "http://localhost:11434")
+MODEL = "nomic-embed-text"
+DIM = 768
+ID_NAMESPACE = uuid.UUID("f47ac10b-58cc-4372-a567-0e02b2c3d479")
+CACHE = os.path.expanduser("~/.cache/herdr-index")
+
+MAX_CHARS = 1150        # hard chunk ceiling (1000 * 1.15)
+SOFT_CHARS = 600        # prefer to cut at a boundary line once a chunk is this long
+MIN_CHARS = 50          # chunks shorter than this merge into their neighbour
+SEGMENT = 1000          # slice size for single lines longer than MAX_CHARS
+MAX_FILE_BYTES = 1024 * 1024
+MAX_JSON_BYTES = 200 * 1024
+EMBED_BATCH = 48        # chunks per Ollama request
+FLUSH_CHUNKS = 96       # chunks accumulated across files before embed + upsert
+
+EXTENSIONS = {
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".py", ".rs", ".go", ".c", ".h",
+    ".cc", ".cpp", ".hpp", ".cs", ".rb", ".java", ".php", ".swift", ".kt", ".kts", ".scala", ".lua",
+    ".sh", ".bash", ".zsh", ".css", ".scss", ".less", ".html", ".md", ".mdx", ".markdown", ".json",
+    ".jsonc", ".yaml", ".yml", ".toml", ".sql", ".glsl", ".wgsl", ".txt", ".ini", ".cfg",
+}
+SKIP_NAMES = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "Cargo.lock", "poetry.lock"}
+BOUNDARY = re.compile(
+    r"^(\s*$|#{1,6}\s|(export\s+)?(default\s+)?(async\s+)?(function|class|interface|type|enum|const|def|fn|pub|impl|struct|trait)\b)")
+
+
+def log(msg):
+    if not QUIET:
+        print(msg, flush=True)
+
+
+def die(msg, code=2):
+    print(f"herdr-index: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+_ind = {"on": False, "last": 0.0}
+
+
+def indicator(text, force=False):
+    """Show/clear an `indexing` token on this Herdr workspace (a no-op outside Herdr).
+
+    Needs a `$indexing` entry in [ui.sidebar.spaces] rows. The 20 s TTL clears a stale
+    indicator if this process dies before it can clear it."""
+    ws, herdr = os.environ.get("HERDR_WORKSPACE_ID"), os.environ.get("HERDR_BIN_PATH", "herdr")
+    if os.environ.get("HERDR_ENV") != "1" or not ws:
+        return
+    now = time.monotonic()
+    if text and not force and now - _ind["last"] < 1.5:
+        return
+    if not text and not _ind["on"]:
+        return
+    args = [herdr, "workspace", "report-metadata", ws, "--source", "herdr-index"]
+    args += ["--token", f"indexing={text}", "--ttl-ms", "20000"] if text else ["--clear-token", "indexing"]
+    try:
+        subprocess.run(args, capture_output=True, timeout=3)
+    except Exception:
+        return
+    _ind["last"], _ind["on"] = now, bool(text)
+
+
+def git(cwd, *args, check=True):
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=check).stdout
+    except Exception:
+        return b""
+
+
+def collection_for(path):
+    return "ws-" + hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------- files
+
+def list_files(root):
+    """Relative paths of indexable files: tracked + untracked, minus ignored."""
+    if git(root, "rev-parse", "--is-inside-work-tree").strip() == b"true":
+        def ls(*flags):
+            return set(git(root, "ls-files", "-z", *flags, check=False).decode("utf-8", "replace").split("\0"))
+        if os.path.exists(os.path.join(root, ".herdrignore")):
+            ign = "--exclude-from=.herdrignore"
+            paths = (ls("-c") - ls("-c", "-i", ign)) | ls("-o", "--exclude-standard", ign)
+        else:
+            paths = ls("-c", "-o", "--exclude-standard")
+    else:
+        paths = set()
+        for d, dirs, names in os.walk(root):
+            dirs[:] = [x for x in dirs if x not in {".git", "node_modules", "dist", "build", "__pycache__", ".venv"}]
+            paths.update(os.path.relpath(os.path.join(d, n), root) for n in names)
+    out = {}
+    for rel in paths:
+        if not rel:
+            continue
+        name = os.path.basename(rel)
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in EXTENSIONS or name in SKIP_NAMES or ".min." in name:
+            continue
+        try:
+            st = os.stat(os.path.join(root, rel))
+        except OSError:
+            continue
+        if not os.path.isfile(os.path.join(root, rel)):
+            continue
+        if st.st_size > MAX_FILE_BYTES or st.st_size == 0 or (ext in (".json", ".jsonc") and st.st_size > MAX_JSON_BYTES):
+            continue
+        out[rel] = st
+    return out
+
+
+def read_text(root, rel):
+    try:
+        raw = open(os.path.join(root, rel), "rb").read()
+    except OSError:
+        return None
+    if b"\0" in raw[:8192]:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+# ---------------------------------------------------------------- chunking
+
+def chunk_text(text):
+    """Line-based chunks as (start_line, end_line, content). Lines are 1-based."""
+    lines = text.split("\n")
+    chunks = []
+    cur, cur_len, cur_start = [], 0, 1
+
+    def flush(end):
+        nonlocal cur, cur_len
+        content = "\n".join(cur).strip("\n")
+        if content.strip():
+            chunks.append([cur_start, end, content])
+        cur, cur_len = [], 0
+
+    for i, line in enumerate(lines, 1):
+        cost = len(line) + 1
+        if cost > MAX_CHARS:
+            if cur:
+                flush(i - 1)
+            for k in range(0, len(line), SEGMENT):
+                chunks.append([i, i, line[k:k + SEGMENT]])
+            continue
+        if cur and cur_len + cost > MAX_CHARS:
+            flush(i - 1)
+        elif cur and cur_len >= SOFT_CHARS and BOUNDARY.match(line):
+            flush(i - 1)
+        if not cur:
+            if not line.strip():
+                continue          # never start a chunk on a blank line
+            cur_start = i
+        cur.append(line)
+        cur_len += cost
+    if cur:
+        flush(len(lines))
+
+    merged = []
+    for c in chunks:              # fold tiny chunks into the previous one when they touch
+        if len(c[2].strip()) < MIN_CHARS and merged and c[0] - merged[-1][1] <= 2 and len(merged[-1][2]) + len(c[2]) < MAX_CHARS * 1.5:
+            merged[-1][1] = c[1]
+            merged[-1][2] += "\n" + c[2]
+        elif len(c[2].strip()) >= MIN_CHARS or not merged:
+            merged.append(c)
+    return [(s, e, t) for s, e, t in merged if len(t.strip()) >= MIN_CHARS]
+
+
+def make_points(root, rel, text):
+    abs_path = os.path.join(root, rel)
+    segments = {str(i): s for i, s in enumerate([p for p in rel.split("/") if p])}
+    seen, out = set(), []
+    for start, end, content in chunk_text(text):
+        h = hashlib.sha256(f"{abs_path}-{start}-{end}-{len(content)}-{content[:100]}".encode("utf-8")).hexdigest()
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append({"id": str(uuid.uuid5(ID_NAMESPACE, h)),
+                    "payload": {"filePath": rel, "codeChunk": content, "startLine": start, "endLine": end,
+                                "segmentHash": h, "pathSegments": segments}})
+    return out
+
+
+# ---------------------------------------------------------------- Qdrant / Ollama
+
+def q(method, path, body=None, timeout=60):
+    r = requests.request(method, f"{QDRANT}{path}", json=body, timeout=timeout)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Qdrant {method} {path}: {r.status_code} {r.text[:200]}")
+    return r.json().get("result")
+
+
+def ensure_collection(name):
+    existing = {c["name"] for c in q("GET", "/collections")["collections"]}
+    created = name not in existing
+    if created:
+        q("PUT", f"/collections/{name}", {
+            "vectors": {"size": DIM, "distance": "Cosine", "on_disk": True},
+            "hnsw_config": {"m": 64, "ef_construct": 512, "on_disk": True},
+            "on_disk_payload": True})
+    fields = ["type", "filePath"] + [f"pathSegments.{i}" for i in range(5)]
+    info = q("GET", f"/collections/{name}")
+    have = set(info.get("payload_schema", {}))
+    for f in fields:
+        if f not in have:
+            q("PUT", f"/collections/{name}/index?wait=true", {"field_name": f, "field_schema": "keyword"})
+    return created
+
+
+def embed(texts):
+    for attempt in range(3):
+        try:
+            r = requests.post(f"{OLLAMA}/api/embed", json={"model": MODEL, "input": texts}, timeout=120)
+            r.raise_for_status()
+            vecs = r.json()["embeddings"]
+            if len(vecs) != len(texts) or any(len(v) != DIM for v in vecs):
+                raise RuntimeError("unexpected embedding shape")
+            return vecs
+        except Exception as e:
+            if attempt == 2:
+                raise RuntimeError(f"embedding failed via Ollama ({e}); is `ollama serve` running with {MODEL}?")
+            time.sleep(1.5 * (attempt + 1))
+
+
+def delete_files(name, rels):
+    if rels:
+        q("POST", f"/collections/{name}/points/delete?wait=true",
+          {"filter": {"should": [{"key": "filePath", "match": {"value": r}} for r in rels]}})
+
+
+def commit(name, batch):
+    """batch: list of (rel, points). Embeds, replaces each file's points, returns nothing."""
+    flat = [(p,) for _, pts in batch for p in pts]
+    vectors = []
+    texts = [p[0]["payload"]["codeChunk"] for p in flat]
+    for i in range(0, len(texts), EMBED_BATCH):
+        vectors += embed(texts[i:i + EMBED_BATCH])
+    delete_files(name, [rel for rel, _ in batch])
+    pts = [{"id": p[0]["id"], "vector": v, "payload": p[0]["payload"]} for p, v in zip(flat, vectors)]
+    for i in range(0, len(pts), 256):
+        q("PUT", f"/collections/{name}/points?wait=true", {"points": pts[i:i + 256]})
+
+
+# ---------------------------------------------------------------- manifest
+
+def load_manifest(path):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return {"files": {}}
+
+
+def save_manifest(path, data):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, path)
+
+
+def file_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    global QUIET
+    args = sys.argv[1:]
+    root, budget, full, status, QUIET, allow_nongit, collection, prune = None, None, False, False, False, False, None, False
+    while args:
+        a = args.pop(0)
+        if a == "--root" and args:
+            root = os.path.realpath(args.pop(0))
+        elif a == "--budget" and args:
+            budget = float(args.pop(0))
+        elif a == "--full":
+            full = True
+        elif a == "--status":
+            status = True
+        elif a == "--quiet":
+            QUIET = True
+        elif a == "--prune":
+            prune = True
+        elif a == "--collection" and args:
+            collection = args.pop(0)
+        elif a == "--allow-nongit":
+            allow_nongit = True
+        else:
+            die(f"unknown option {a}")
+    if root is None:
+        root = git(os.getcwd(), "rev-parse", "--show-toplevel", check=False).decode().strip() or os.getcwd()
+    is_git = git(root, "rev-parse", "--is-inside-work-tree", check=False).strip() == b"true"
+    if root in (os.path.expanduser("~"), "/") or not (is_git or allow_nongit):
+        die(f"refusing to index {root}: not a git repository (pass --allow-nongit to override; never HOME or /)")
+    deadline = time.monotonic() + budget if budget else None
+    name = collection or collection_for(root)
+
+    os.makedirs(CACHE, exist_ok=True)
+    lock = open(os.path.join(CACHE, f"{name}.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if status:
+            pass
+        else:
+            sys.exit(4)
+
+    try:
+        files = list_files(root)
+        mpath = os.path.join(CACHE, f"{name}.json")
+        manifest = {"files": {}} if full else load_manifest(mpath)
+        if not status and not full:
+            try:
+                have = name in {c["name"] for c in q("GET", "/collections")["collections"]}
+            except Exception:
+                have = True
+            if not have:           # collection deleted behind our back: the manifest is stale
+                manifest = {"files": {}}
+        known = manifest["files"]
+
+        pending, unchanged = [], 0
+        for rel, st in files.items():
+            m = known.get(rel)
+            if m and m["mtime_ns"] == st.st_mtime_ns and m["size"] == st.st_size:
+                unchanged += 1
+                continue
+            pending.append(rel)
+        removed = [r for r in known if r not in files]
+
+        if status:
+            try:
+                count = q("GET", f"/collections/{name}")["points_count"]
+            except Exception:
+                count = None
+            print(f"root {root}\ncollection {name} ({'missing' if count is None else f'{count} points'})\n"
+                  f"files {len(files)}; unchanged by stat {unchanged}; to check {len(pending)}; removed {len(removed)}")
+            return
+
+        if prune:
+            ensure_collection(name)
+            stale, offset = set(), None
+            while True:
+                res = q("POST", f"/collections/{name}/points/scroll",
+                        {"limit": 1000, "offset": offset, "with_payload": ["filePath"], "with_vector": False})
+                stale |= {p["payload"]["filePath"] for p in res["points"] if p["payload"].get("filePath")}
+                offset = res.get("next_page_offset")
+                if offset is None:
+                    break
+            stale -= set(files)
+            stale = sorted(stale)
+            for i in range(0, len(stale), 50):
+                delete_files(name, stale[i:i + 50])
+            log(f"pruned points for {len(stale)} files no longer indexable")
+
+        if not pending and not removed:
+            log("index up to date")
+            return
+
+        ensure_collection(name)
+        if removed:
+            for i in range(0, len(removed), 50):
+                delete_files(name, removed[i:i + 50])
+            for r in removed:
+                known.pop(r, None)
+            save_manifest(mpath, manifest)
+
+        done, skipped, batch, batch_chunks = 0, 0, [], 0
+        incomplete = False
+        started = time.monotonic()
+
+        def progress():
+            # Only surface work that lasts more than a moment, so quick refreshes never flash.
+            if time.monotonic() - started > 1.0:
+                indicator(f"⟳ indexing {done + skipped}/{len(pending)}")
+
+        def flush():
+            nonlocal batch, batch_chunks, done
+            if not batch:
+                return
+            commit(name, [(r, p) for r, p, _ in batch])
+            for r, _, m in batch:
+                known[r] = m
+            done += len(batch)
+            batch, batch_chunks = [], 0
+            save_manifest(mpath, manifest)
+            progress()
+
+        for rel in sorted(pending):
+            if deadline and time.monotonic() > deadline:
+                incomplete = True
+                break
+            st = files[rel]
+            text = read_text(root, rel)
+            if text is None:
+                known[rel] = {"mtime_ns": st.st_mtime_ns, "size": st.st_size, "hash": ""}
+                continue
+            h = file_hash(text)
+            meta = {"mtime_ns": st.st_mtime_ns, "size": st.st_size, "hash": h}
+            if not full and known.get(rel, {}).get("hash") == h:
+                known[rel] = meta      # touched but identical
+                skipped += 1
+                progress()
+                continue
+            pts = make_points(root, rel, text)
+            batch.append((rel, pts, meta))
+            batch_chunks += len(pts)
+            if batch_chunks >= FLUSH_CHUNKS:
+                flush()
+        flush()
+        save_manifest(mpath, manifest)
+
+        if not incomplete:
+            q("PUT", f"/collections/{name}/points?wait=true", {"points": [{
+                "id": str(uuid.uuid5(ID_NAMESPACE, "herdr-index-metadata")), "vector": [0.0] * DIM,
+                "payload": {"type": "metadata", "indexing_complete": True, "completed_at": int(time.time() * 1000)}}]})
+        left = len(pending) - done - skipped
+        log(f"indexed {done} files, {skipped} unchanged, {len(removed)} removed"
+            + (f", {left} still pending" if incomplete else ""))
+        if incomplete:
+            sys.exit(3)
+    finally:
+        if sys.exc_info()[1] is None or getattr(sys.exc_info()[1], "code", None) != 3:
+            indicator(None)
+        lock.close()
+
+
+if __name__ == "__main__":
+    QUIET = False
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        die(str(e))

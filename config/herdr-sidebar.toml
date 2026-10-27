@@ -1,0 +1,8 @@
+# Add to ~/.config/herdr/config.toml, then run: herdr server reload-config
+# Shows "⟳ indexing N/M" on the workspace row while herdr-index is embedding files.
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace"],
+  ["branch", "git_status"],
+  [{ token = "$indexing", fg = "#f9e2af", bold = true }],
+]

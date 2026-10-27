@@ -1,0 +1,79 @@
+# herdr-search
+
+Semantic code search for pi agents that works without VS Code. A standalone indexer keeps a
+Qdrant index fresh, and a small CLI queries it.
+
+```
+pi tool semantic_code_search  ->  herdr-search  ->  herdr-index (refresh) -> Ollama + Qdrant
+```
+
+## Components
+
+| Path | Installed to | Purpose |
+|---|---|---|
+| `bin/herdr-index` | `~/.local/bin/herdr-index` | Incremental indexer (chunk, embed, upsert, delete) |
+| `bin/herdr-search` | `~/.local/bin/herdr-search` | Query CLI: refreshes the index, embeds the query, ranks results |
+| `extension/semantic-search.ts` | `~/.pi/agent/extensions/semantic-search.ts` | pi tool wrapper (`semantic_code_search`) |
+| `config/herdr-sidebar.toml` | merge into `~/.config/herdr/config.toml` | Optional "indexing" indicator in the Herdr sidebar |
+
+## Requirements
+
+- Python 3 with `requests`
+- `git`
+- Ollama on `localhost:11434` with `nomic-embed-text` (`ollama pull nomic-embed-text`)
+- Qdrant on `localhost:6333`
+- pi (for the tool wrapper) and optionally Herdr (for the sidebar indicator)
+
+Override endpoints with `HERDR_QDRANT` and `HERDR_OLLAMA`.
+
+## Install
+
+```sh
+./install.sh   # symlinks the scripts and the extension; reload pi afterwards
+```
+
+## How it works
+
+- **Collection:** `ws-` + `sha256(git root)[:16]`; 768-d cosine vectors from `nomic-embed-text`.
+- **Payload:** `filePath` (relative), `codeChunk`, `startLine`, `endLine`, `segmentHash`, `pathSegments`.
+  Point id is `uuid5(segmentHash, f47ac10b-58cc-4372-a567-0e02b2c3d479)` (a fixed namespace) and
+  `segmentHash = sha256("<abs path>-<start>-<end>-<len>-<first 100 chars>")`.
+- **Chunking:** line-based, up to about 1150 characters, preferring blank-line and declaration
+  boundaries.
+- **Files:** `git ls-files -co --exclude-standard`, minus an optional `.herdrignore`. Extension
+  allowlist, 1 MB cap (200 KB for JSON), lockfiles and minified files skipped. Non-git directories
+  are refused unless `--allow-nongit` is given; `$HOME` and `/` are always refused.
+- **Change detection:** manifest in `~/.cache/herdr-index/<collection>.json` (mtime and size, then
+  content hash). Changed files are deleted and re-upserted; removed files are deleted. One lock per
+  collection.
+- **Freshness:** every `herdr-search` runs `herdr-index --budget 25` first. Work beyond the budget
+  continues in a detached background run and the results start with a note. No daemon is needed.
+- **Worktrees:** a linked worktree without its own index uses the main checkout's index, reading
+  files from the worktree.
+- **Ranking:** semantic score, plus a `git grep` boost for identifier-like terms, tests slightly
+  down-weighted, `log-archive/` excluded unless `--all`.
+- **Speed:** embedding throughput (about 105 chunks/s on the author's machine) is the limit; batching
+  and parallel requests did not help. A full 9.7k-chunk index takes about 95 s; a no-op refresh about 0.3 s.
+
+## Usage
+
+```sh
+herdr-search [--files N] [--path PREFIX] [--list] [--all] <query...>
+
+herdr-index [--root DIR] [--budget SEC] [--full] [--status] [--prune] [--quiet]
+            [--collection NAME] [--allow-nongit]
+# exit codes: 0 up to date, 2 error, 3 budget hit (more pending), 4 another run active
+```
+
+Environment: `HERDR_NO_REFRESH=1` skips the refresh in `herdr-search`; `HERDR_COLLECTION` overrides
+the collection (for experiments).
+
+## Herdr sidebar indicator
+
+Inside Herdr, `herdr-index` sets an `indexing` token on the current workspace
+(`herdr workspace report-metadata`, 20 s TTL) once a run lasts more than 1 s. Add the row from
+`config/herdr-sidebar.toml` to your Herdr config to display it.
+
+## Notes
+
+- Deleting a collection in Qdrant is safe: the indexer notices it is missing and the next search rebuilds it.
