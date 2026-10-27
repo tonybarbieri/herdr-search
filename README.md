@@ -88,7 +88,8 @@ Ollama (reachable, `nomic-embed-text` installed, embeddings are 768-d), records 
 While unhealthy, every Herdr workspace shows a red `⚠ search down: <component>` row (the
 `$searchwarn` token in `config/herdr-sidebar.toml`), and Herdr posts one notification when the state
 flips to unhealthy and one when it recovers. Errors returned to agents say what is down and tell them
-to report it to you before falling back to grep. There is no background daemon, so a backend that
+to report it to you before falling back to grep. Run `/search-status` in pi for an on-demand probe plus how current the index for the current repo is.
+There is no background daemon, so a backend that
 dies between sessions is noticed at the next session start or search.
 
 ## Notes

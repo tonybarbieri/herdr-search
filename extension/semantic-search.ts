@@ -28,6 +28,27 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
+  // /search-status: a fresh probe of the backends plus how current this repo's index is.
+  const run = async (args: string[]) => {
+    try {
+      const { stdout } = await execFileAsync(indexerPath, args, { timeout: 60_000 });
+      return { ok: true, out: stdout.trim() };
+    } catch (err: any) {
+      return { ok: false, out: (err.stdout || err.stderr || err.message || "").toString().trim() };
+    }
+  };
+  pi.registerCommand("search-status", {
+    description: "Check the semantic search backends (Qdrant, Ollama) and the index for this repo",
+    handler: async (_args, ctx) => {
+      const health = await run(["--doctor"]);
+      const status = await run(["--status"]);
+      // --status already reports the point count, so drop the doctor's duplicate "info index" line.
+      const doctor = health.out.split("\n").filter((l) => !l.startsWith("info index")).join("\n");
+      const lines = [doctor, status.ok ? status.out : ""].filter(Boolean);
+      ctx.ui.notify(lines.join("\n"), health.ok ? "info" : "warning");
+    },
+  });
+
   pi.registerTool({
     name: "semantic_code_search",
     description:
