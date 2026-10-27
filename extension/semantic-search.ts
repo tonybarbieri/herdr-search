@@ -28,7 +28,7 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  // /search-status: a fresh probe of the backends plus how current this repo's index is.
+  // status=true: a fresh probe of the backends plus how current this repo's index is.
   const run = async (args: string[]) => {
     try {
       const { stdout } = await execFileAsync(indexerPath, args, { timeout: 60_000 });
@@ -37,17 +37,17 @@ export default function (pi: ExtensionAPI) {
       return { ok: false, out: (err.stdout || err.stderr || err.message || "").toString().trim() };
     }
   };
-  pi.registerCommand("search-status", {
-    description: "Check the semantic search backends (Qdrant, Ollama) and the index for this repo",
-    handler: async (_args, ctx) => {
-      const health = await run(["--doctor"]);
-      const status = await run(["--status"]);
-      // --status already reports the point count, so drop the doctor's duplicate "info index" line.
-      const doctor = health.out.split("\n").filter((l) => !l.startsWith("info index")).join("\n");
-      const lines = [doctor, status.ok ? status.out : ""].filter(Boolean);
-      ctx.ui.notify(lines.join("\n"), health.ok ? "info" : "warning");
-    },
-  });
+  const searchStatus = async () => {
+    const health = await run(["--doctor"]);
+    const status = await run(["--status"]);
+    // --status already reports the point count, so drop the doctor's duplicate "info index" line.
+    const doctor = health.out.split("\n").filter((l) => !l.startsWith("info index")).join("\n");
+    const text = [doctor, status.ok ? status.out : ""].filter(Boolean).join("\n");
+    return {
+      ...(health.ok ? {} : { isError: true }),
+      content: [{ type: "text", text }],
+    };
+  };
 
   pi.registerTool({
     name: "semantic_code_search",
@@ -55,7 +55,8 @@ export default function (pi: ExtensionAPI) {
       "Semantic search over the current repo's Qdrant index (Ollama embeddings; refreshed automatically before each query, no VS Code needed). Returns the best-matching files with " +
       "snippets read from the working tree (line numbers re-located after edits). Identifier-like terms (camelCase, " +
       "snake_case, dotted or `backticked`) also get an exact-match boost via git grep. Tests and specs rank slightly " +
-      "below implementation; archived logs are excluded unless includeAll is set.",
+      "below implementation; archived logs are excluded unless includeAll is set. Pass status=true (no query needed) " +
+      "to check whether Qdrant and Ollama are up and how current this repo's index is.",
     parameters: {
       type: "object",
       properties: {
@@ -71,13 +72,21 @@ export default function (pi: ExtensionAPI) {
         },
         listOnly: { type: "boolean", description: "Return ranked paths and line ranges only, without snippets." },
         includeAll: { type: "boolean", description: "Rank tests/specs/log archives at full weight." },
+        status: {
+          type: "boolean",
+          description: "Report search health (Qdrant, Ollama) and index freshness instead of searching. No query needed.",
+        },
       },
-      required: ["query"],
+      required: [],
     },
     execute: async (
       _toolCallId,
-      params: { query: string; files?: number; path?: string; listOnly?: boolean; includeAll?: boolean },
+      params: { query?: string; files?: number; path?: string; listOnly?: boolean; includeAll?: boolean; status?: boolean },
     ) => {
+      if (params.status) return searchStatus();
+      if (!params.query) {
+        return { isError: true, content: [{ type: "text", text: "Provide a query, or pass status=true to check search health." }] };
+      }
       const args: string[] = [];
       if (params.files) args.push("--files", String(Math.max(1, Math.floor(params.files))));
       if (params.path) args.push("--path", params.path);
